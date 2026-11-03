@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DNS 节点优化前后性能对比报告</title>
+<style>
+  :root{
+    --ink:#1a1d21; --muted:#5b6470; --line:#dfe3e8; --bg:#ffffff;
+    --accent:#1f5fbf; --accent2:#c2410c; --ok:#0f7a4d; --warn:#b45309; --bad:#b42318;
+    --soft:#f6f8fa;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:#eef1f4; color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB","Microsoft YaHei","Source Han Sans SC",sans-serif;
+    font-size:14px; line-height:1.7; -webkit-font-smoothing:antialiased;
+  }
+  .page{max-width:920px;margin:0 auto;background:var(--bg);padding:56px 64px 72px;
+    box-shadow:0 1px 3px rgba(0,0,0,.08),0 12px 32px rgba(0,0,0,.06);}
+  header{border-bottom:2px solid var(--ink);padding-bottom:20px;margin-bottom:34px}
+  .kicker{font-size:12px;letter-spacing:.16em;color:var(--muted);text-transform:uppercase;margin-bottom:10px}
+  h1{font-size:27px;line-height:1.35;margin:0 0 14px;letter-spacing:-.01em}
+  .meta{display:flex;flex-wrap:wrap;gap:6px 26px;font-size:12.5px;color:var(--muted)}
+  .meta b{color:var(--ink);font-weight:600}
+  h2{font-size:18px;margin:44px 0 14px;padding-left:11px;border-left:4px solid var(--accent);line-height:1.3}
+  h3{font-size:14.5px;margin:26px 0 10px;color:var(--ink)}
+  p{margin:0 0 12px}
+  table{width:100%;border-collapse:collapse;margin:14px 0 18px;font-size:13px}
+  th,td{padding:9px 12px;border-bottom:1px solid var(--line);text-align:left}
+  th{background:var(--soft);font-weight:600;font-size:12.5px;color:#3a4149;border-bottom:1.5px solid #cfd6dd}
+  td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+  tbody tr:hover{background:#fafbfc}
+  .verdict{background:var(--soft);border-left:4px solid var(--accent);padding:18px 22px;margin:20px 0 26px;border-radius:0 6px 6px 0}
+  .verdict p:last-child{margin-bottom:0}
+  .big{font-size:15px;font-weight:600;line-height:1.65}
+  .tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11.5px;font-weight:600;vertical-align:1px}
+  .t-ok{background:#e6f4ec;color:var(--ok)}
+  .t-warn{background:#fdf2e3;color:var(--warn)}
+  .t-bad{background:#fdecea;color:var(--bad)}
+  .t-neutral{background:#eef1f5;color:#475569}
+  .cards{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin:18px 0 22px}
+  .card{border:1px solid var(--line);border-radius:8px;padding:16px 18px;background:#fff}
+  .card .k{font-size:12px;color:var(--muted);margin-bottom:6px}
+  .card .v{font-size:22px;font-weight:700;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+  .card .s{font-size:11.5px;color:var(--muted);margin-top:4px}
+  .chart{margin:20px 0 8px;text-align:center}
+  .chart svg{max-width:100%;height:auto}
+  .cap{font-size:12px;color:var(--muted);margin-top:6px;text-align:center}
+  .note{border:1px solid #f0d9b5;background:#fffaf0;border-radius:8px;padding:14px 18px;margin:16px 0;font-size:13px}
+  .note .h{font-weight:700;color:var(--warn);margin-bottom:6px;font-size:13px}
+  code{background:#f1f3f5;padding:1px 5px;border-radius:4px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px}
+  pre{background:#1e2430;color:#e6e9ee;padding:14px 18px;border-radius:8px;overflow-x:auto;font-size:12px;line-height:1.6}
+  pre code{background:none;padding:0;color:inherit;font-size:12px}
+  .bars{margin:18px 0}
+  .barrow{display:grid;grid-template-columns:150px 1fr 92px;align-items:center;gap:12px;margin-bottom:10px;font-size:12.5px}
+  .barrow .lab{color:var(--muted);text-align:right}
+  .track{background:#eef1f4;border-radius:4px;height:22px;position:relative;overflow:hidden}
+  .fill{height:100%;border-radius:4px}
+  .barrow .val{font-variant-numeric:tabular-nums;font-weight:600;font-size:12.5px}
+  .legend{display:flex;gap:20px;justify-content:center;font-size:12px;color:var(--muted);margin-top:4px}
+  .legend i{display:inline-block;width:14px;height:3px;border-radius:2px;vertical-align:middle;margin-right:6px}
+  footer{margin-top:48px;padding-top:18px;border-top:1px solid var(--line);font-size:11.5px;color:var(--muted);display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px}
+  @media print{
+    body{background:#fff;font-size:11.5pt}
+    .page{box-shadow:none;max-width:none;padding:0 8mm}
+    h2{page-break-after:avoid} table,.chart,.cards{page-break-inside:avoid}
+  }
+  @media (max-width:720px){
+    .page{padding:28px 20px}
+    .cards{grid-template-columns:1fr}
+    .barrow{grid-template-columns:110px 1fr 76px}
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+<header>
+  <div class="kicker">Performance Comparison Report</div>
+  <h1>DNS 自建节点优化前后性能对比报告</h1>
+  <div class="meta">
+    <span><b>节点</b> 172.21.80.142（VM-80-142-tencentos）</span>
+    <span><b>软件</b> unbound 1.17.1</span>
+    <span><b>基线</b> 2026-11-03 12:18</span>
+    <span><b>复测</b> 2026-11-03 14:52</span>
+    <span><b>工具</b> dnsperf 2.12.0 / 内网</span>
+  </div>
+</header>
+
+<div class="verdict">
+  <p class="big">复测结论：本次优化作用在<strong>回源路径</strong>，热缓存路径<strong>无法通过本轮压测判定</strong>。</p>
+  <p>压测端（2 vCPU / virtio_net）的收发路径上限为 <strong>54.4k QPS</strong>，而节点本机实测能力为 <strong>93–99k QPS</strong>。两者相差近一倍，导致热路径的任何变化都被压测端天花板掩盖。冷路径实测小幅改善，方向与节点自测数据一致。</p>
+</div>
+
+<h2>一、核心指标对照</h2>
+
+<div class="cards">
+  <div class="card">
+    <div class="k">热缓存吞吐（UDP）</div>
+    <div class="v">54.0k → 54.4k</div>
+    <div class="s"><span class="tag t-neutral">不可判定</span> 两侧均触压测端上限</div>
+  </div>
+  <div class="card">
+    <div class="k">冷缓存 / 回源</div>
+    <div class="v">966 → 1,007</div>
+    <div class="s"><span class="tag t-ok">+4.2%</span> 延迟 95.9 → 87.1 ms</div>
+  </div>
+  <div class="card">
+    <div class="k">SERVFAIL 率（冷缓存）</div>
+    <div class="v">4.88% → 3.01%</div>
+    <div class="s"><span class="tag t-ok">-1.87pp</span> 首跳失败重试减少</div>
+  </div>
+</div>
+
+<table>
+  <thead>
+    <tr><th>维度</th><th>优化前</th><th>优化后</th><th>变化</th><th>判定</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>热缓存吞吐（UDP）</td><td class="num">54,000 QPS</td><td class="num">54,400 QPS</td><td class="num">+0.7%</td><td><span class="tag t-neutral">无分辨力</span></td></tr>
+    <tr><td>50k 负载平均延迟</td><td class="num">1.937 ms</td><td class="num">1.989 ms</td><td class="num">+2.7%</td><td><span class="tag t-ok">未退化</span></td></tr>
+    <tr><td>70k 过载平均延迟</td><td class="num">3.536 ms</td><td class="num">3.579 ms</td><td class="num">+1.2%</td><td><span class="tag t-ok">未退化</span></td></tr>
+    <tr><td>回源吞吐</td><td class="num">966 QPS</td><td class="num">1,007 QPS</td><td class="num">+4.2%</td><td><span class="tag t-ok">改善</span></td></tr>
+    <tr><td>回源平均延迟</td><td class="num">95.9 ms</td><td class="num">87.1 ms</td><td class="num">-9.2%</td><td><span class="tag t-ok">改善</span></td></tr>
+    <tr><td>回源丢包率</td><td class="num">2.42%</td><td class="num">1.68%</td><td class="num">-0.74pp</td><td><span class="tag t-ok">改善</span></td></tr>
+    <tr><td>TCP 长连接（c=20）</td><td class="num">25,092 QPS</td><td class="num">24,920 QPS</td><td class="num">-0.7%</td><td><span class="tag t-neutral">持平·符合预期</span></td></tr>
+  </tbody>
+</table>
+
+<h2>二、热缓存路径：并发与延迟形态</h2>
+
+<h3>2.1 并发梯次（无限速，各 5 秒）</h3>
+<table>
+  <thead>
+    <tr><th>clients / threads</th><th class="num">优化前 QPS</th><th class="num">优化后 QPS</th><th class="num">差值</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>1 / 1</td><td class="num">54,480</td><td class="num">57,066</td><td class="num">+4.7%</td></tr>
+    <tr><td>4 / 2</td><td class="num">54,116</td><td class="num">54,387</td><td class="num">+0.5%</td></tr>
+    <tr><td>20 / 2</td><td class="num">53,723</td><td class="num">54,256</td><td class="num">+1.0%</td></tr>
+    <tr><td>100 / 2</td><td class="num">54,636</td><td class="num">53,624</td><td class="num">-1.9%</td></tr>
+    <tr><td>400 / 2</td><td class="num">49,095</td><td class="num">49,770</td><td class="num">+1.4%</td></tr>
+    <tr><td>20 / 4</td><td class="num">54,022</td><td class="num">54,420</td><td class="num">+0.7%</td></tr>
+  </tbody>
+</table>
+<p style="font-size:12.5px;color:var(--muted)">并发从 1 加到 400、线程从 2 加到 4，吞吐始终锁在 54k 附近。这不是"性能未变"，而是两次测量都撞在同一条天花板上。</p>
+
+<h3>2.2 延迟随负载的变化（限速梯度）</h3>
+<div class="chart">
+  <svg viewBox="0 0 640 270" width="640" height="270" role="img" aria-label="延迟随下发速率变化曲线">
+    <!-- grid -->
+    <g stroke="#e6e9ee" stroke-width="1">
+      <line x1="60" y1="20" x2="600" y2="20"/>
+      <line x1="60" y1="70" x2="600" y2="70"/>
+      <line x1="60" y1="120" x2="600" y2="120"/>
+      <line x1="60" y1="170" x2="600" y2="170"/>
+      <line x1="60" y1="220" x2="600" y2="220"/>
+    </g>
+    <!-- y labels -->
+    <g fill="#8a94a0" font-size="10.5" text-anchor="end">
+      <text x="50" y="24">4.0</text><text x="50" y="74">3.0</text>
+      <text x="50" y="124">2.0</text><text x="50" y="174">1.0</text><text x="50" y="224">0</text>
+    </g>
+    <text x="18" y="130" fill="#5b6470" font-size="10.5" transform="rotate(-90 18 130)" text-anchor="middle">平均延迟 (ms)</text>
+    <!-- x labels -->
+    <g fill="#8a94a0" font-size="10.5" text-anchor="middle">
+      <text x="60" y="242">20k</text><text x="160" y="242">40k</text>
+      <text x="260" y="242">50k</text><text x="360" y="242">60k</text>
+      <text x="460" y="242">70k</text><text x="560" y="242">100k</text>
+    </g>
+    <text x="330" y="264" fill="#5b6470" font-size="10.5" text-anchor="middle">下发速率 (QPS)</text>
+    <!-- before line -->
+    <polyline fill="none" stroke="#c2410c" stroke-width="2.2"
+      points="60,159.2 160,147.0 260,123.2 360,52.5 460,43.2"/>
+    <g fill="#c2410c">
+      <circle cx="60" cy="159.2" r="3.6"/><circle cx="160" cy="147.0" r="3.6"/>
+      <circle cx="260" cy="123.2" r="3.6"/><circle cx="360" cy="52.5" r="3.6"/>
+      <circle cx="460" cy="43.2" r="3.6"/>
+    </g>
+    <!-- after line -->
+    <polyline fill="none" stroke="#1f5fbf" stroke-width="2.2" stroke-dasharray="6 3"
+      points="60,161.2 160,151.1 260,120.6 360,50.4 460,41.1 560,42.7"/>
+    <g fill="#1f5fbf">
+      <circle cx="60" cy="161.2" r="3.6"/><circle cx="160" cy="151.1" r="3.6"/>
+      <circle cx="260" cy="120.6" r="3.6"/><circle cx="360" cy="50.4" r="3.6"/>
+      <circle cx="460" cy="41.1" r="3.6"/><circle cx="560" cy="42.7" r="3.6"/>
+    </g>
+    <!-- annotation -->
+    <line x1="330" y1="30" x2="330" y2="228" stroke="#94a3b8" stroke-width="1" stroke-dasharray="3 4"/>
+    <text x="336" y="40" fill="#64748b" font-size="10.5">约 55k 起进入排队区</text>
+  </svg>
+  <div class="legend">
+    <span><i style="background:#c2410c"></i>优化前</span>
+    <span><i style="background:#1f5fbf"></i>优化后（虚线）</span>
+  </div>
+  <div class="cap">图 1　两条曲线在 50k 以下基本重合，60k 后同时抬升——延迟形态未发生结构性变化，快路径未被改坏</div>
+</div>
+
+<table>
+  <thead>
+    <tr><th>下发速率</th><th class="num">优化前 延迟</th><th class="num">优化后 延迟</th><th class="num">优化前 / 后 QPS</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>20,000</td><td class="num">1.217 ms</td><td class="num">1.177 ms</td><td class="num">19,999 / 19,998</td></tr>
+    <tr><td>40,000</td><td class="num">1.461 ms</td><td class="num">1.378 ms</td><td class="num">39,789 / 39,888</td></tr>
+    <tr><td>50,000</td><td class="num">1.937 ms</td><td class="num">1.989 ms</td><td class="num">49,267 / 49,220</td></tr>
+    <tr><td>60,000</td><td class="num">3.351 ms</td><td class="num">3.393 ms</td><td class="num">55,144 / 54,639</td></tr>
+    <tr><td>70,000</td><td class="num">3.536 ms</td><td class="num">3.579 ms</td><td class="num">54,989 / 54,293</td></tr>
+    <tr><td>100,000</td><td class="num">—</td><td class="num">3.546 ms</td><td class="num">— / 54,918</td></tr>
+  </tbody>
+</table>
+
+<h2>三、为什么热路径测不出来</h2>
+
+<p>复测做了三重扩展验证，吞吐始终锁死在 54k：</p>
+
+<div class="bars">
+  <div class="barrow">
+    <div class="lab">单进程 1 线程</div>
+    <div class="track"><div class="fill" style="width:100%;background:#1f5fbf"></div></div>
+    <div class="val">54,480</div>
+  </div>
+  <div class="barrow">
+    <div class="lab">4 进程并行（合计）</div>
+    <div class="track"><div class="fill" style="width:99.9%;background:#1f5fbf"></div></div>
+    <div class="val">54,443</div>
+  </div>
+  <div class="barrow">
+    <div class="lab">节点本机实测</div>
+    <div class="track"><div class="fill" style="width:173%;background:#0f7a4d"></div></div>
+    <div class="val">94,000</div>
+  </div>
+  <div class="cap" style="text-align:left;margin-left:162px">4 个独立进程吞吐相加仍为 54k，说明限制点在单进程之外；节点本机能力约为该值的 1.7 倍</div>
+</div>
+
+<table>
+  <thead><tr><th>排除项</th><th>观测值</th><th>结论</th></tr></thead>
+  <tbody>
+    <tr><td>压测端 loopback 能力</td><td>93,791 – 102,860 QPS</td><td>软件层无瓶颈</td></tr>
+    <tr><td>压测端 CPU @ 54k</td><td>user 24.1% / sys 32.1% / softirq 9.6% / <b>idle 34.1%</b></td><td>算力未打满</td></tr>
+    <tr><td>softnet / 网卡丢包</td><td>0 / 0</td><td>协议栈无丢包</td></tr>
+    <tr><td>网卡形态</td><td>virtio_net，2 combined 队列，2 vCPU</td><td>宿主机 pps 限额为常见成因</td></tr>
+    <tr><td>4 进程并行</td><td>13,666 + 13,600 + 13,602 + 13,575 = 54,443</td><td>非单进程限制</td></tr>
+  </tbody>
+</table>
+
+<div class="note">
+  <div class="h">判定</div>
+  <b>54k = 压测路径上限，94k = 节点能力。</b>本轮复测对"热路径是否提升"没有分辨力。节点实际能力高于本轮所有热缓存测量值，因此本报告不对热路径优化效果下结论。
+</div>
+
+<h2>四、回源路径对照</h2>
+
+<table>
+  <thead>
+    <tr><th>指标</th><th class="num">优化前</th><th class="num">优化后</th><th class="num">变化</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>回源吞吐（2,000 未缓存域）</td><td class="num">966 QPS</td><td class="num">1,007 QPS</td><td class="num">+4.2%</td></tr>
+    <tr><td>平均延迟</td><td class="num">95.9 ms</td><td class="num">87.1 ms</td><td class="num">-9.2%</td></tr>
+    <tr><td>丢包率</td><td class="num">2.42%</td><td class="num">1.68%</td><td class="num">-0.74pp</td></tr>
+    <tr><td>SERVFAIL 占比</td><td class="num">4.88%</td><td class="num">3.01%</td><td class="num">-1.87pp</td></tr>
+    <tr><td>NXDOMAIN 占比</td><td class="num">6.66%</td><td class="num">25.23%</td><td class="num">测试集不同</td></tr>
+  </tbody>
+</table>
+
+<div class="note">
+  <div class="h">对照有效性说明</div>
+  无服务端权限，无法 flush 缓存后重放同一批域名，两次冷测使用不同的 2,000 域名切片（第 5001–7000 行 vs 第 7001–9000 行）。NXDOMAIN 占比从 6.66% 升至 25.23%，说明两次域名质量不同。<b>该组数据只能看方向，不能作为严格的 A/B 对比。</b>
+</div>
+
+<h2>五、与节点侧自测数据的交叉验证</h2>
+
+<table>
+  <thead><tr><th>指标</th><th>节点自测（服务端）</th><th>本轮黑盒复测</th><th>一致性</th></tr></thead>
+  <tbody>
+    <tr><td>热缓存吞吐</td><td>94k → 93–99k（持平）</td><td>54.0k → 54.4k（封顶）</td><td>方向一致，黑盒无分辨力</td></tr>
+    <tr><td>冷查询 p50</td><td>220 → 151 ms（-31%）</td><td>平均 95.9 → 87.1 ms（-9.2%）*</td><td><span class="tag t-ok">方向一致</span></td></tr>
+    <tr><td>回源吞吐</td><td>858 → 1,049（+22%）</td><td>966 → 1,007（+4.2%）*</td><td><span class="tag t-ok">方向一致</span></td></tr>
+    <tr><td>SERVFAIL</td><td>—</td><td>4.88% → 3.01%</td><td><span class="tag t-ok">改善</span></td></tr>
+  </tbody>
+</table>
+<p style="font-size:12.5px;color:var(--muted)">* 幅度偏小的原因：① 黑盒测的是全量平均延迟（含大量快路径），非迭代 p50；② 两次域名切片不同；③ 测试集为"未缓存域名 + 既有 TLD 缓存"，而非全新域名。</p>
+
+<p><b>综合判断：</b>优化在回源路径上确实生效，黑盒数据能佐证方向，但精度不足以量化幅度。</p>
+
+<h2>六、容量模型确认</h2>
+
+<p>采纳命中率加权模型：</p>
+<pre><code>C_total = 1 / ( H / C_hit + (1-H) / C_miss )
+
+H       = 热缓存命中率
+C_hit   = 热缓存单节点吞吐（规划值 50,000）
+C_miss  = 回源单节点吞吐（实测 1,049，按 800 规划）</code></pre>
+
+<table>
+  <thead><tr><th>命中率 H</th><th class="num">单节点吞吐</th><th>适用业务</th></tr></thead>
+  <tbody>
+    <tr><td>100%</td><td class="num">50,000</td><td>理论值，不可达</td></tr>
+    <tr><td>99.5%</td><td class="num">22,000</td><td>高热度业务（CDN、大站）</td></tr>
+    <tr><td>99.0%</td><td class="num">15,500</td><td>典型 Web 业务</td></tr>
+    <tr><td>98.0%</td><td class="num">10,300</td><td>长尾业务</td></tr>
+    <tr><td>95.0%</td><td class="num">5,250</td><td>爬虫 / 监控类</td></tr>
+    <tr><td>90.0%</td><td class="num">2,700</td><td>几乎不重复</td></tr>
+  </tbody>
+</table>
+
+<p><b>补充：</b>C_hit 取 50k 作为规划值是安全的——本轮证明单个普通 2 vCPU 客户端即可将节点压到 54k 且零丢包，节点实际仍有近一倍余量。但需同时注意：<b>单客户端观测上限就是 54k</b>，扩容判据不能依赖单机压测。</p>
+
+<h2>七、方法局限</h2>
+<table>
+  <thead><tr><th>#</th><th>局限</th><th>影响</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>压测源为 2 vCPU / virtio 单机，热路径上限 54k</td><td>无法验证 94k 区间的任何变化</td></tr>
+    <tr><td>2</td><td>无服务端权限，无法 flush 缓存重放同一批域名</td><td>冷测引入域名质量差异，不能严格 A/B</td></tr>
+    <tr><td>3</td><td>全程黑盒，无 cache hit/miss、迭代耗时指标</td><td>无法直接观测优化项的实际生效情况</td></tr>
+  </tbody>
+</table>
+
+<h2>八、下一步建议</h2>
+<table>
+  <thead><tr><th class="num">优先级</th><th>动作</th><th>解决的问题</th></tr></thead>
+  <tbody>
+    <tr><td class="num">P0</td><td>换压测源：≥4 vCPU 且开启 virtio 多队列，或多机并行</td><td>唯一能验证热路径优化的办法</td></tr>
+    <tr><td class="num">P0</td><td>接入 <code>unbound-control stats_noreset</code> 指标（cachemiss / hits / recursion.time / servfail）</td><td>命中率加权容量模型的数据基础</td></tr>
+    <tr><td class="num">P1</td><td>重启后立即冷测，对比"TLD 预热 vs 不预热"的冷查询 p50</td><td>验证本次最有效改动的真实收益</td></tr>
+    <tr><td class="num">P1</td><td>用大量全新域名把回源压满，观察 <code>requestlist.exceeded</code></td><td>验证 outgoing-range 提升效果</td></tr>
+  </tbody>
+</table>
+
+<footer>
+  <span>DNS 节点性能对比报告 · 修订版</span>
+  <span>2026-11-03　（初版"优化无效"结论已作废）</span>
+</footer>
+
+</div>
+</body>
+</html>

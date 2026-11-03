@@ -196,6 +196,8 @@ unbound -c /etc/unbound/unbound.conf -d -vvv
 
 `.com`/`.net` 等 TLD 的 NS 记录 TTL 为 48 小时，一旦缓存即可长期复用。但服务重启后缓存为空，所有查询都要走「根 → TLD」两跳海外链路，单次 150ms+，吞吐直接掉到千级。
 
+**不只一级 TLD**：`fastly.net`、`akamaized.net` 这类**二级 CDN 后缀**的 NS 也要单独迭代。实测未预热时 `fastly.net` 的 p90 达 896ms，预热后降到 495ms。脚本默认内置了常见 CDN 后缀，**建议按业务实际流量补充 `SUFFIXES` 变量**。
+
 ```bash
 install -m 755 scripts/preheat-tld.sh /usr/local/bin/preheat-tld.sh
 
@@ -326,13 +328,7 @@ wc -l cache_hit.txt cold_mix.txt
 
 ```bash
 # 生成真正的全新域名
-python3 -c "
-import random, string
-with open('/tmp/cold_fresh.txt','w') as f:
-    for i in range(20000):
-        s = ''.join(random.choices(string.ascii_lowercase, k=10))
-        f.write(f'{s}{i}.example.com A\n')
-"
+python3 ../scripts/gen_cold.py -n 20000 -o /tmp/cold_fresh.txt
 ```
 
 ### 6.2 目标 QPS 验证（2 万）
