@@ -96,17 +96,48 @@ systemctl daemon-reload
 
 ## 3. 部署 Unbound（递归层）
 
-### 3.1 下发配置
+### 3.1 生成 root.hints（按网络环境定制）
+
+**这一步不能跳过。** 从国内访问 13 台根服务器，实测 RTT 从 4ms 到 258ms 不等，丢包率 0% 到 55% 不等。unbound 默认均匀选择，很大概率命中慢速根。
+
+```bash
+python3 scripts/probe-roots.py -n 4 -o /etc/unbound/root.hints
+```
+
+输出示例（实测数据）：
+
+```
+选中的根:
+  f.root-servers.net     192.5.5.241      fail=0 p50=4ms
+  j.root-servers.net     192.58.128.30    fail=0 p50=5ms
+  l.root-servers.net     199.7.83.42      fail=0 p50=23ms
+  k.root-servers.net     193.0.14.129     fail=0 p50=38ms
+
+以下根应加入 do-not-query-address:
+    do-not-query-address: 198.41.0.4/32
+    ...
+```
+
+**注意**：脚本输出的 `do-not-query-address` 列表必须同步到 `recursor.conf`。**只配 `root-hints` 不够** —— unbound 首次查询根区 NS 时会做 NS priming，把全部 13 台根重新纳入选择池，覆盖 root.hints 的限制。
+
+### 3.2 下发配置
 
 ```bash
 mkdir -p /run/unbound
 cp etc/unbound/conf.d/recursor.conf /etc/unbound/conf.d/recursor.conf
 cp etc/unbound/unbound.conf          /etc/unbound/unbound.conf
+cp etc/unbound/root.hints            /etc/unbound/root.hints
 chown unbound:unbound /run/unbound
 unbound-checkconf && echo OK
 ```
 
-### 3.2 ⚠️ 关键：替换发行版主配置
+确认 `recursor.conf` 中的 `do-not-query-address` 与探测结果一致：
+
+```bash
+grep do-not-query-address /etc/unbound/conf.d/recursor.conf
+```
+
+### 3.3 ⚠️ 关键：替换发行版主配置
 
 **TencentOS / OpenCloudOS 默认的 `/etc/unbound/unbound.conf` 会导致 unbound 启动失败**，原因：
 
@@ -123,7 +154,7 @@ include: /etc/unbound/conf.d/recursor.conf
 
 > 部署到其他发行版时，若其默认配置不含 `auth-zone "."`，可直接在默认配置后追加 include，不必替换。
 
-### 3.3 根信任锚
+### 3.4 根信任锚
 
 ```bash
 ls -l /var/lib/unbound/root.key
@@ -133,7 +164,7 @@ unbound-anchor -a /var/lib/unbound/root.key -v
 
 保证 `auto-trust-anchor-file` 指向的文件 **只包含根 KSK**，不要混入其他信任锚。
 
-### 3.4 启动与验证
+### 3.5 启动、TLD 预热与验证
 
 ```bash
 systemctl enable --now unbound
@@ -144,12 +175,60 @@ dig @127.0.0.1 -p 5353 www.example.com A
 dig @127.0.0.1 -p 5353 dnssec-failed.org A    # 期望 SERVFAIL
 ```
 
+确认只用了最快的根：
+
+```bash
+unbound-control dump_infra | grep " \. " | awk '{print $1}'
+# 期望只输出 f/j/l/k 对应的 4 个 IP，不应出现 198.41.0.4 等
+```
+
 若失败：
 
 ```bash
 journalctl -u unbound -n 50 --no-pager
 # 或前台调试
 unbound -c /etc/unbound/unbound.conf -d -vvv
+```
+
+### 3.6 ⚠️ TLD 缓存预热（必做）
+
+**不预热会导致服务重启后冷启动期吞吐只有 ~1,000 QPS。**
+
+`.com`/`.net` 等 TLD 的 NS 记录 TTL 为 48 小时，一旦缓存即可长期复用。但服务重启后缓存为空，所有查询都要走「根 → TLD」两跳海外链路，单次 150ms+，吞吐直接掉到千级。
+
+```bash
+install -m 755 scripts/preheat-tld.sh /usr/local/bin/preheat-tld.sh
+
+cat > /etc/systemd/system/tld-preheat.service <<'EOF'
+[Unit]
+Description=Preheat TLD NS records into unbound cache
+After=unbound.service
+Requires=unbound.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/preheat-tld.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now tld-preheat.service
+```
+
+输出应类似：
+
+```
+preheating TLD NS records via 127.0.0.1#5353 ...
+TLD preheat done: ok=42 fail=1
+```
+
+**建议同时加入定时任务**（每天一次），防止长时间运行后 TLD 缓存被清理：
+
+```bash
+echo '0 4 * * * /usr/local/bin/preheat-tld.sh >> /var/log/tld-preheat.log 2>&1' | crontab -
 ```
 
 ## 4. 部署 dnsdist（接入层）
@@ -243,6 +322,19 @@ python3 ../bench/gen_queries.py
 wc -l cache_hit.txt cold_mix.txt
 ```
 
+> **注意：冷缓存测试必须每轮生成全新域名。** 同一份冷数据集第二次压测时已全部命中缓存，测出的是热缓存结果（实测可达 86k QPS），完全没有参考价值。
+
+```bash
+# 生成真正的全新域名
+python3 -c "
+import random, string
+with open('/tmp/cold_fresh.txt','w') as f:
+    for i in range(20000):
+        s = ''.join(random.choices(string.ascii_lowercase, k=10))
+        f.write(f'{s}{i}.example.com A\n')
+"
+```
+
 ### 6.2 目标 QPS 验证（2 万）
 
 ```bash
@@ -278,24 +370,80 @@ dnsperf -s 127.0.0.1 -d cache_hit.txt -c 200 -T 8 -l 15
 dnsperf -s 127.0.0.1 -p 5353 -d cache_hit.txt -c 200 -T 8 -l 15
 ```
 
-参考值：约 125k QPS。若该值远高于 dnsdist 结果，说明瓶颈在 dnsdist 接入层。
+参考值：约 93k–99k QPS。若该值远高于 dnsdist 结果，说明瓶颈在 dnsdist 接入层。
 
 ### 6.5 冷域名（真递归）
 
+**必须用全新域名**（见 6.1）：
+
 ```bash
-dnsperf -s 127.0.0.1 -d cold_mix.txt -c 100 -T 8 -l 15
+dnsperf -s 127.0.0.1 -p 5353 -d /tmp/cold_fresh.txt -c 100 -T 8 -l 15
 ```
 
-参考值：约 1.1k QPS，平均延迟 100ms（受上游 RTT 限制，属正常）。
+参考值（优化后）：**约 1,049 QPS**，平均延迟 95ms，100% NOERROR、0 丢包。
+
+单次迭代延迟分布（优化后）：
+
+```
+min=112  p50=151   p75=221   p90=329   p99=1208   max=1208  (ms)
+快路径(<300ms): 78%
+```
+
+> 冷查询延迟的物理下限约 150ms（根 4ms + TLD 120ms + 权威 30ms）。p90 的长尾来自 `.com`/`.net` TLD 30–50% 的丢包和 1s 起步的 RTO 重传，属于网络层固有限制，配置无法消除。详见 [tuning-report.md](tuning-report.md)。
+
+### 6.6 对照外部 DNS（可选）
+
+验证自建节点的实际表现与云厂商 DNS 的差距：
+
+```bash
+python3 - <<'EOF'
+import dns.query, dns.message, time, random, string, statistics
+
+def run(server, host, port=53):
+    q = dns.message.make_query(host, "A")
+    t0 = time.perf_counter()
+    try:
+        dns.query.udp(q, server, port=port, timeout=6)
+        return (time.perf_counter()-t0)*1000
+    except Exception:
+        return None
+
+res = {"ext": [], "self": []}
+for suf in ["github.io","herokuapp.com","cloudfront.net","s3.amazonaws.com"]:
+    for k in range(5):
+        h = "zz%s%d.%s" % ("".join(random.choices(string.ascii_lowercase, k=10)), k, suf)
+        a = run("183.60.82.98", h)      # 换成你的对照 DNS
+        b = run("127.0.0.1", h, port=5353)
+        if a: res["ext"].append(a)
+        if b: res["self"].append(b)
+
+for k, l in res.items():
+    l.sort()
+    print("%-5s n=%d p50=%.0f p90=%.0f max=%.0f" % (
+        k, len(l), l[len(l)//2], l[int(len(l)*0.9)], l[-1]))
+EOF
+```
+
+参考值（优化后）：自建 p50 ≈ 82ms / p90 ≈ 184ms；外部 DNS p50 ≈ 58ms / p90 ≈ 165ms。差距主要来自 TLD 层的物理链路。
 
 ## 7. 多节点部署（10 万 QPS）
 
-在每台节点执行第 1~6 步，然后：
+在每台节点执行第 1~6 步（**root.hints 与 TLD 预热每台都要做**），然后：
 
 1. **云 CLB / VIP**：配置 UDP 53 四层监听，后端为所有节点内网 IP
 2. **健康检查**：UDP 探活 + TCP 探活（部分云厂商 UDP 探活不可靠，建议同时配 TCP）
 3. **dnsdist 策略**：改为 `setServerPolicy(roundrobin)`（单机时用 `firstAvailable` 无所谓，但多节点必须轮询）
-4. **节点数**：`峰值QPS / 15000`，向上取整 + 1（冗余）
+4. **节点数**：按命中率计算，**不要用固定 15000**：
+
+```
+C_total = 1 / ( H/50000 + (1-H)/800 )
+节点数 = 峰值QPS / C_total + 1(冗余)
+
+例: 10万 QPS @ 99% 命中 -> C≈15500 -> 7 台 + 1 = 8 台
+    10万 QPS @ 99.5% 命中 -> C≈22000 -> 5 台 + 1 = 6 台
+```
+
+5. **扩容判据**（任一触发）：QPS 超规划值 / 命中率 < 99% / **回源 QPS > 800** / 迭代 p90 > 500ms / SERVFAIL > 0.5%
 
 ## 8. 运维手册
 
@@ -309,7 +457,13 @@ systemctl status unbound dnsdist
 ss -lunp | grep ':53 '
 
 # 查看缓存统计
-unbound-control stats_noreset | grep -E 'cache.hits|cache.miss|answer.servfail'
+unbound-control stats_noreset | grep -E 'num.cachehits|num.cachemiss|num.answer.servfail|recursion.time'
+
+# 查看当前使用的是哪些根服务器（应只有 f/j/l/k）
+unbound-control dump_infra | grep " \. " | awk '{print $1}'
+
+# 手工预热 TLD
+/usr/local/bin/preheat-tld.sh
 
 # 查看 dnsdist 后端状态
 dnsdist -C /etc/dnsdist/dnsdist.conf -c 'showServers()'
@@ -351,6 +505,10 @@ dnsdist --check-config -C /etc/dnsdist/dnsdist.conf
 | 大量 SERVFAIL | 检查 DNSSEC 时间是否准确（`timedatectl`）、上游可达性 |
 | 缓存命中率低 | 检查是否存在大量随机子域名；考虑 `prefetch: yes` 已开启 |
 | 吞吐上不去 | 对比 6.4 直连 unbound，定位是否 dnsdist 瓶颈 |
+| **重启后吞吐只有 ~1,000** | TLD 缓存为空。执行 `preheat-tld.sh`；确认 `tld-preheat.service` 已启用 |
+| **冷查询普遍 >500ms** | 检查 `dump_infra` 是否混入了慢速根；确认 `do-not-query-address` 生效 |
+| **冷查询 p90 突增** | 探测 `.com`/`.net` TLD 丢包率（见 tuning-report.md 第 3.1 节）；这是运营商链路问题 |
+| **prefetch 计数始终为 0** | 正常现象。prefetch 仅对高度集中的热点生效，不能用于解决冷启动 |
 
 ## 9. 部署检查清单
 
@@ -361,10 +519,15 @@ dnsdist --check-config -C /etc/dnsdist/dnsdist.conf
 - [ ] ulimit 与 systemd `LimitNOFILE` 已配置
 - [ ] unbound 主配置已替换（避免 auth-zone 冲突）
 - [ ] root.key 存在且仅含根 KSK
+- [ ] 已执行 `probe-roots.py`，root.hints 生成完毕
+- [ ] `do-not-query-address` 与探测结果一致，`dump_infra` 只剩快速根
+- [ ] TLD 预热已执行，`tld-preheat.service` 已启用
 - [ ] dnsdist.conf 属主为 `root:dnsdist` 权限 640
 - [ ] **ACL 已收紧到实际 VPC 网段**
 - [ ] **控制台密钥已用 `makeKey()` 重新生成**
 - [ ] 冒烟测试 5 项全部通过
+- [ ] 冷查询 p50 < 200ms、p90 < 500ms
+- [ ] 回源吞吐 ≥ 800 QPS
 - [ ] 压测达到目标 QPS 且丢包为 0
 - [ ] 已配置监控告警
 - [ ] 已规划多节点/VIP 容灾

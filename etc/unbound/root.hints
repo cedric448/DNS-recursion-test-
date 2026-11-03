@@ -1,0 +1,11 @@
+; 自定义 root hints - 仅保留实测可达且延迟最低的根服务器
+; 由 scripts/probe-roots.py 探测生成，建议每季度复测
+; 修改后需同步更新 recursor.conf 中的 do-not-query-address
+.                        3600000  NS    f.root-servers.net.
+f.root-servers.net.      3600000  A     192.5.5.241
+.                        3600000  NS    j.root-servers.net.
+j.root-servers.net.      3600000  A     192.58.128.30
+.                        3600000  NS    l.root-servers.net.
+l.root-servers.net.      3600000  A     199.7.83.42
+.                        3600000  NS    k.root-servers.net.
+k.root-servers.net.      3600000  A     193.0.14.129
